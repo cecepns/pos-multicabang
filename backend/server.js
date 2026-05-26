@@ -2476,6 +2476,77 @@ app.post('/api/attendances/clock-out', authMiddleware, requireRoles('karyawan', 
   }
 });
 
+/** Nilai aset dashboard: stok (qty × HPP) + estimasi saldo kanal (admin) */
+async function computeDashboardTotalAssets(pool, { roleSlug, userBranchId, assetsBranchId, includeWallet }) {
+  const params = {};
+  let branchStockWhere = ' WHERE p.is_active = 1 ';
+  if (assetsBranchId) {
+    branchStockWhere += ' AND sb.branch_id = :abid ';
+    params.abid = assetsBranchId;
+  } else if (roleSlug !== 'super_admin') {
+    branchStockWhere += ' AND sb.branch_id = :abid ';
+    params.abid = Number(userBranchId) || 0;
+  }
+  const [[branchRow]] = await pool.query(
+    `SELECT COALESCE(SUM(sb.quantity * p.hpp), 0) AS v
+     FROM stock_branch sb
+     JOIN products p ON p.id = sb.product_id
+     ${branchStockWhere}`,
+    params
+  );
+  const stock_branch = Number(branchRow?.v) || 0;
+
+  let stock_central = 0;
+  if (roleSlug === 'super_admin' && !assetsBranchId) {
+    const [[centralRow]] = await pool.query(
+      `SELECT COALESCE(SUM(sc.quantity * p.hpp), 0) AS v
+       FROM stock_central sc
+       JOIN products p ON p.id = sc.product_id
+       WHERE p.is_active = 1`
+    );
+    stock_central = Number(centralRow?.v) || 0;
+  }
+
+  let wallet_balance_estimate = 0;
+  if (includeWallet) {
+    const wparams = {};
+    let bfTop = '';
+    let bfMan = '';
+    let bfSale = '';
+    if (assetsBranchId) {
+      wparams.abid = assetsBranchId;
+      bfTop = ' AND branch_id = :abid ';
+      bfMan = ' AND branch_id = :abid ';
+      bfSale = ' AND s.branch_id = :abid ';
+    } else if (roleSlug !== 'super_admin') {
+      wparams.abid = Number(userBranchId) || 0;
+      bfTop = ' AND branch_id = :abid ';
+      bfMan = ' AND branch_id = :abid ';
+      bfSale = ' AND s.branch_id = :abid ';
+    }
+    const [[walletRow]] = await pool.query(
+      `SELECT
+        (SELECT COALESCE(SUM(amount), 0) FROM wallet_topup_lines WHERE 1=1 ${bfTop}) -
+        (SELECT COALESCE(SUM(cost_amount), 0) FROM wallet_manual_lines WHERE 1=1 ${bfMan}) -
+        (SELECT COALESCE(SUM(si.quantity * wcp.default_cost), 0)
+         FROM sale_items si
+         INNER JOIN wallet_channel_products wcp ON wcp.id = si.wallet_channel_product_id
+         INNER JOIN sales s ON s.id = si.sale_id
+         WHERE si.wallet_channel_product_id IS NOT NULL ${bfSale}) AS v`,
+      wparams
+    );
+    wallet_balance_estimate = Number(walletRow?.v) || 0;
+  }
+
+  return {
+    stock_branch,
+    stock_central,
+    wallet_balance_estimate,
+    grand_total: stock_branch + stock_central + wallet_balance_estimate,
+    scope_branch_id: assetsBranchId || (roleSlug !== 'super_admin' ? Number(userBranchId) || null : null),
+  };
+}
+
 /* Dashboard */
 app.get('/api/dashboard/summary', authMiddleware, async (req, res) => {
   try {
@@ -2654,6 +2725,22 @@ app.get('/api/dashboard/summary', authMiddleware, async (req, res) => {
       }
       today_omset_filters = { branches: omset_branches, cashiers };
     }
+
+    const assetsBranchId =
+      req.user.role_slug === 'super_admin' && qTodayBranch
+        ? qTodayBranch
+        : req.user.role_slug !== 'super_admin'
+          ? Number(req.user.branch_id) || null
+          : null;
+    const includeWalletAssets =
+      !staffToday && (req.user.role_slug === 'super_admin' || req.user.role_slug === 'admin_cabang');
+    const total_assets = await computeDashboardTotalAssets(pool, {
+      roleSlug: req.user.role_slug,
+      userBranchId: req.user.branch_id,
+      assetsBranchId,
+      includeWallet: includeWalletAssets,
+    });
+
     return ok(
       res,
       {
@@ -2665,6 +2752,7 @@ app.get('/api/dashboard/summary', authMiddleware, async (req, res) => {
         low_stock: lowStock,
         today_omset,
         today_omset_filters,
+        total_assets,
       },
       ''
     );

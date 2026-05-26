@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
-import { TrendingUp, Wallet, Package, Building2 } from 'lucide-react';
+import { TrendingUp, Wallet, Package, Building2, Landmark } from 'lucide-react';
 import { PageHeader } from '@/components/PageHeader';
 import { dashboardService } from '@/services/dashboardService';
 import { formatCurrency } from '@/utils/format';
@@ -69,6 +69,14 @@ export default function DashboardPage() {
   const s = data?.sales_30d;
   const tom = data?.today_omset;
   const omsetFilters = data?.today_omset_filters;
+  const ta = data?.total_assets;
+  const showCentralAsset = ta && Number(ta.stock_central) > 0;
+  const showWalletAssetRow =
+    ta && !staffToday && (user?.role_slug === 'super_admin' || user?.role_slug === 'admin_cabang');
+  const assetsScopedBranch =
+    user?.role_slug === 'super_admin' && omsetBranchId
+      ? (omsetFilters?.branches || []).find((b) => String(b.id) === omsetBranchId)
+      : null;
   const chart = (data?.chart_sales || []).map((r) => ({
     name: chartLabel(r, staffToday),
     total: Number(r.total) || 0,
@@ -129,6 +137,61 @@ export default function DashboardPage() {
           </ul>
         </div>
       </div>
+
+      {ta ? (
+        <div className="relative mt-6 rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50/80 to-white p-5 shadow-sm">
+          {omsetRefreshing ? (
+            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-white/60 text-sm font-medium text-slate-600">
+              Memuat…
+            </div>
+          ) : null}
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+                <Landmark className="h-4 w-4 text-indigo-600" />
+                Total aset
+              </h3>
+              <p className="mt-1 text-xs text-slate-600">
+                Stok = qty × HPP (modal).
+                {showCentralAsset ? ' Stok pusat = gudang pusat (seluruh cabang).' : ''}
+                {showWalletAssetRow ? ' Saldo kanal = estimasi top-up − keluar (manual + penjualan kanal).' : ''}
+                {assetsScopedBranch
+                  ? ` Cabang: ${assetsScopedBranch.code} — ${assetsScopedBranch.name}.`
+                  : user?.role_slug === 'super_admin' && !omsetBranchId
+                    ? ' Stok cabang: semua cabang.'
+                    : ''}
+                {omsetFilters && user?.role_slug === 'super_admin'
+                  ? ' Filter cabang di omset juga memengaruhi stok cabang & saldo kanal.'
+                  : ''}
+              </p>
+            </div>
+            <div className="rounded-xl border border-indigo-300 bg-white px-4 py-3 text-right shadow-sm">
+              <p className="text-xs font-medium text-slate-500">Total aset</p>
+              <p className="mt-1 text-lg font-bold tabular-nums text-indigo-900">{formatCurrency(ta.grand_total)}</p>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="rounded-xl border border-slate-100 bg-white/90 px-3 py-3">
+              <p className="text-xs font-medium text-slate-500">Stok cabang (nilai modal)</p>
+              <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCurrency(ta.stock_branch)}</p>
+            </div>
+            {showCentralAsset ? (
+              <div className="rounded-xl border border-slate-100 bg-white/90 px-3 py-3">
+                <p className="text-xs font-medium text-slate-500">Stok pusat (nilai modal)</p>
+                <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">{formatCurrency(ta.stock_central)}</p>
+              </div>
+            ) : null}
+            {showWalletAssetRow ? (
+              <div className="rounded-xl border border-slate-100 bg-white/90 px-3 py-3">
+                <p className="text-xs font-medium text-slate-500">Saldo kanal (estimasi)</p>
+                <p className="mt-1 text-sm font-semibold tabular-nums text-slate-900">
+                  {formatCurrency(ta.wallet_balance_estimate)}
+                </p>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
 
       {tom && (
         <div className="relative mt-6 rounded-2xl border border-brand-200 bg-gradient-to-br from-brand-50 to-white p-5 shadow-sm">

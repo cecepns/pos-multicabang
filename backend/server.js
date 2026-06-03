@@ -3601,21 +3601,15 @@ function computeMiniAtmDeltas({ transactionType, cardStatus, nominal, adminFee, 
   let cashDelta = 0;
   let bankDelta = 0;
 
-  if (transactionType === 'transfer') {
-    if (cardStatus === 'tanpa_kartu') {
-      cashDelta = n;
-      bankDelta = -(n + af);
-    }
+  if (transactionType === 'transfer' && cardStatus === 'tanpa_kartu') {
+    cashDelta = n;
+    bankDelta = -(n + af);
   } else if (transactionType === 'tarik_tunai') {
     cashDelta = -n;
   }
 
   if (adminFeeType === 'potong_luar') {
-    if (transactionType === 'transfer' && cardStatus === 'tanpa_kartu') {
-      cashDelta += af;
-    } else if (transactionType === 'tarik_tunai') {
-      cashDelta += af;
-    }
+    cashDelta += af;
   }
 
   return { cashDelta, bankDelta };
@@ -3728,7 +3722,7 @@ app.get('/api/mini-atm/summary', authMiddleware, requireRoles('super_admin', 'ad
         COUNT(*) AS total_trx,
         SUM(CASE WHEN transaction_type = 'transfer' THEN 1 ELSE 0 END) AS total_transfer,
         SUM(CASE WHEN transaction_type = 'tarik_tunai' THEN 1 ELSE 0 END) AS total_tarik,
-        COALESCE(SUM(admin_fee), 0) AS total_admin_income
+        COALESCE(SUM(CASE WHEN admin_fee_type = 'potong_luar' THEN admin_fee ELSE 0 END), 0) AS total_admin_income
        FROM mini_atm_transactions
        WHERE branch_id = :bid AND DATE(transaction_at) = CURDATE()`,
       { bid }

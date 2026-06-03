@@ -608,7 +608,11 @@ export default function MiniAtmPage() {
         <div className="xl:col-span-2">
           <div className="sticky top-4 rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50/80 to-white p-5 shadow-sm">
             <h3 className="text-sm font-semibold text-slate-900">Preview perhitungan</h3>
-            <p className="mt-1 text-xs text-slate-600">Diperbarui otomatis saat field berubah</p>
+            <p className="mt-1 text-xs text-slate-600">
+              Transfer pakai kartu: saldo tidak berubah (kecuali potong luar → cash +biaya admin). Transfer tanpa kartu:
+              cash +nominal, rekening -(nominal + biaya admin). Tarik tunai: cash -nominal. Potong luar menambah cash
+              sebesar biaya admin.
+            </p>
             {preview ? (
               <dl className="mt-4 space-y-3 text-sm">
                 <div className="flex justify-between gap-2">

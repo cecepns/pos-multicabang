@@ -19,27 +19,28 @@ export const MINI_ATM_TX_LABELS = Object.fromEntries(MINI_ATM_TX_TYPES.map((x) =
 export const MINI_ATM_CARD_LABELS = Object.fromEntries(MINI_ATM_CARD_STATUS.map((x) => [x.value, x.label]));
 export const MINI_ATM_ADMIN_FEE_LABELS = Object.fromEntries(MINI_ATM_ADMIN_FEE_TYPES.map((x) => [x.value, x.label]));
 
+/**
+ * Aturan saldo Mini ATM (sumber: spesifikasi client):
+ * 1. Transfer + Pakai Kartu → cash & rekening tidak berubah
+ * 2. Transfer + Tanpa Kartu → rekening -(nominal + biaya admin), cash +nominal
+ * 3. Tarik tunai (pakai/tanpa kartu) → cash -nominal, rekening tidak berubah
+ * 4. Potong Luar → cash +biaya admin; Potong Dalam → tidak ada tambahan dari biaya admin
+ */
 export function computeMiniAtmDeltas({ transactionType, cardStatus, nominal, adminFee, adminFeeType }) {
   const n = Math.max(0, Number(nominal) || 0);
   const af = Math.max(0, Number(adminFee) || 0);
   let cashDelta = 0;
   let bankDelta = 0;
 
-  if (transactionType === 'transfer') {
-    if (cardStatus === 'tanpa_kartu') {
-      cashDelta = n;
-      bankDelta = -(n + af);
-    }
+  if (transactionType === 'transfer' && cardStatus === 'tanpa_kartu') {
+    cashDelta = n;
+    bankDelta = -(n + af);
   } else if (transactionType === 'tarik_tunai') {
     cashDelta = -n;
   }
 
   if (adminFeeType === 'potong_luar') {
-    if (transactionType === 'transfer' && cardStatus === 'tanpa_kartu') {
-      cashDelta += af;
-    } else if (transactionType === 'tarik_tunai') {
-      cashDelta += af;
-    }
+    cashDelta += af;
   }
 
   return { cashDelta, bankDelta };

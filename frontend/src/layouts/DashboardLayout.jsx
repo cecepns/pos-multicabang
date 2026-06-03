@@ -23,6 +23,7 @@ import {
   Radio,
   Smartphone,
   Banknote,
+  Landmark,
 } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
 import { ROLES } from '@/utils/constants';
@@ -47,6 +48,7 @@ const nav = [
   { to: '/wallet-channels', label: 'Kanal aplikasi', icon: Radio, roles: ['super_admin', 'admin_cabang'] },
   { to: '/wallet-channel-products', label: 'Produk kanal', icon: Smartphone, roles: ['super_admin', 'admin_cabang', 'kasir'] },
   { to: '/wallet-branch-saldo', label: 'Saldo kanal cabang', icon: Banknote, roles: ['super_admin', 'admin_cabang'] },
+  { to: '/mini-atm', label: 'Mini ATM', icon: Landmark, roles: ['super_admin', 'admin_cabang', 'kasir', 'karyawan'] },
   { to: '/stock-central', label: 'Stok Pusat', icon: Warehouse, roles: ['super_admin', 'admin_cabang'] },
   { to: '/stock-branch', label: 'Stok Cabang', icon: Store, roles: ['super_admin', 'admin_cabang', 'kasir'] },
   { to: '/transfers', label: 'Transfer Stok', icon: ArrowLeftRight, roles: ['super_admin', 'admin_cabang', 'kasir'] },

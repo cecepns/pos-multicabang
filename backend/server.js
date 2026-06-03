@@ -3571,6 +3571,598 @@ app.get('/api/reports/attendance', authMiddleware, requireRoles('super_admin', '
   }
 });
 
+/* ============================== Mini ATM ============================== */
+
+const MINI_ATM_DEFAULT_ADMIN_FEE = 1450;
+
+function resolveMiniAtmBranchId(req, bodyOrQueryBranchId) {
+  if (req.user.role_slug === 'super_admin') {
+    const raw =
+      bodyOrQueryBranchId != null && bodyOrQueryBranchId !== ''
+        ? bodyOrQueryBranchId
+        : req.query.branch_id;
+    const bid = Number(raw);
+    return bid > 0 ? bid : 0;
+  }
+  return Number(req.user.branch_id) || 0;
+}
+
+function miniAtmCanWrite(role) {
+  return role === 'super_admin' || role === 'admin_cabang' || role === 'kasir';
+}
+
+function miniAtmCanManage(role) {
+  return role === 'super_admin' || role === 'admin_cabang';
+}
+
+function computeMiniAtmDeltas({ transactionType, cardStatus, nominal, adminFee, adminFeeType }) {
+  const n = Math.max(0, Number(nominal) || 0);
+  const af = Math.max(0, Number(adminFee) || 0);
+  let cashDelta = 0;
+  let bankDelta = 0;
+
+  if (transactionType === 'transfer') {
+    if (cardStatus === 'tanpa_kartu') {
+      cashDelta = n;
+      bankDelta = -(n + af);
+    }
+  } else if (transactionType === 'tarik_tunai') {
+    cashDelta = -n;
+  }
+
+  if (adminFeeType === 'potong_luar') {
+    if (transactionType === 'transfer' && cardStatus === 'tanpa_kartu') {
+      cashDelta += af;
+    } else if (transactionType === 'tarik_tunai') {
+      cashDelta += af;
+    }
+  }
+
+  return { cashDelta, bankDelta };
+}
+
+function miniAtmTxNumber() {
+  return `MATM-${Date.now()}-${Math.floor(Math.random() * 900 + 100)}`;
+}
+
+async function getOrCreateMiniAtmBalances(db, branchId, { forUpdate = false } = {}) {
+  await db.query(
+    `INSERT INTO mini_atm_branch_balances (branch_id, cash_balance, bank_balance, default_admin_fee)
+     VALUES (:bid, 0, 0, :daf)
+     ON DUPLICATE KEY UPDATE branch_id = branch_id`,
+    { bid: branchId, daf: MINI_ATM_DEFAULT_ADMIN_FEE }
+  );
+  const lock = forUpdate ? ' FOR UPDATE' : '';
+  const [rows] = await db.query(
+    `SELECT branch_id, cash_balance, bank_balance, default_admin_fee, updated_at
+     FROM mini_atm_branch_balances WHERE branch_id = :bid${lock}`,
+    { bid: branchId }
+  );
+  return rows[0];
+}
+
+async function logMiniAtmAudit(conn, { branchId, userId, entity, entityId, action, oldData, newData, ip }) {
+  await conn.query(
+    `INSERT INTO mini_atm_audit_logs (branch_id, user_id, entity, entity_id, action, old_data, new_data, ip_address)
+     VALUES (:bid, :uid, :entity, :eid, :action, :oldd, :newd, :ip)`,
+    {
+      bid: branchId,
+      uid: userId,
+      entity: entity || 'mini_atm_transaction',
+      eid: entityId != null ? entityId : null,
+      action,
+      oldd: oldData ? JSON.stringify(oldData) : null,
+      newd: newData ? JSON.stringify(newData) : null,
+      ip: ip || null,
+    }
+  );
+}
+
+function mapMiniAtmTxRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    nominal: Number(row.nominal) || 0,
+    admin_fee: Number(row.admin_fee) || 0,
+    opening_cash: Number(row.opening_cash) || 0,
+    closing_cash: Number(row.closing_cash) || 0,
+    opening_bank: Number(row.opening_bank) || 0,
+    closing_bank: Number(row.closing_bank) || 0,
+    cash_delta: Number(row.cash_delta) || 0,
+    bank_delta: Number(row.bank_delta) || 0,
+  };
+}
+
+app.get('/api/mini-atm/context', authMiddleware, requireRoles('super_admin', 'admin_cabang', 'kasir', 'karyawan'), async (req, res) => {
+  try {
+    const bid = resolveMiniAtmBranchId(req);
+    if (req.user.role_slug === 'super_admin' && !bid) {
+      const [branches] = await pool.query(`SELECT id, code, name FROM branches ORDER BY name`);
+      return ok(res, {
+        branch_id: null,
+        branch: null,
+        branches,
+        cash_balance: 0,
+        bank_balance: 0,
+        default_admin_fee: MINI_ATM_DEFAULT_ADMIN_FEE,
+        permissions: {
+          can_write: miniAtmCanWrite(req.user.role_slug),
+          can_manage: miniAtmCanManage(req.user.role_slug),
+          can_view_audit: miniAtmCanManage(req.user.role_slug),
+        },
+      });
+    }
+    if (!bid) return fail(res, 400, 'Cabang wajib dipilih');
+    const bal = await getOrCreateMiniAtmBalances(pool, bid);
+    const [br] = await pool.query(`SELECT id, code, name FROM branches WHERE id = :id`, { id: bid });
+    let branches = [];
+    if (req.user.role_slug === 'super_admin') {
+      const [bx] = await pool.query(`SELECT id, code, name FROM branches ORDER BY name`);
+      branches = bx;
+    }
+    return ok(res, {
+      branch_id: bid,
+      branch: br[0] || null,
+      branches,
+      cash_balance: Number(bal.cash_balance) || 0,
+      bank_balance: Number(bal.bank_balance) || 0,
+      default_admin_fee: Number(bal.default_admin_fee) || MINI_ATM_DEFAULT_ADMIN_FEE,
+      permissions: {
+        can_write: miniAtmCanWrite(req.user.role_slug),
+        can_manage: miniAtmCanManage(req.user.role_slug),
+        can_view_audit: miniAtmCanManage(req.user.role_slug),
+      },
+    });
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.get('/api/mini-atm/summary', authMiddleware, requireRoles('super_admin', 'admin_cabang', 'kasir', 'karyawan'), async (req, res) => {
+  try {
+    const bid = resolveMiniAtmBranchId(req);
+    if (!bid) return fail(res, 400, 'Cabang wajib dipilih');
+    const bal = await getOrCreateMiniAtmBalances(pool, bid);
+    const [[stats]] = await pool.query(
+      `SELECT
+        COUNT(*) AS total_trx,
+        SUM(CASE WHEN transaction_type = 'transfer' THEN 1 ELSE 0 END) AS total_transfer,
+        SUM(CASE WHEN transaction_type = 'tarik_tunai' THEN 1 ELSE 0 END) AS total_tarik,
+        COALESCE(SUM(admin_fee), 0) AS total_admin_income
+       FROM mini_atm_transactions
+       WHERE branch_id = :bid AND DATE(transaction_at) = CURDATE()`,
+      { bid }
+    );
+    return ok(res, {
+      total_trx_today: Number(stats.total_trx) || 0,
+      total_transfer_today: Number(stats.total_transfer) || 0,
+      total_tarik_today: Number(stats.total_tarik) || 0,
+      total_admin_income_today: Number(stats.total_admin_income) || 0,
+      cash_balance: Number(bal.cash_balance) || 0,
+      bank_balance: Number(bal.bank_balance) || 0,
+    });
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.put('/api/mini-atm/balances', authMiddleware, requireRoles('super_admin', 'admin_cabang'), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const bid = resolveMiniAtmBranchId(req, req.body.branch_id);
+    if (!bid) return fail(res, 400, 'Cabang wajib');
+    if (req.user.role_slug === 'admin_cabang' && Number(req.user.branch_id) !== bid) {
+      return fail(res, 403, 'Hanya cabang sendiri');
+    }
+    const cash_balance = req.body.cash_balance != null ? Number(req.body.cash_balance) : null;
+    const bank_balance = req.body.bank_balance != null ? Number(req.body.bank_balance) : null;
+    const default_admin_fee =
+      req.body.default_admin_fee != null ? Number(req.body.default_admin_fee) : MINI_ATM_DEFAULT_ADMIN_FEE;
+    if (cash_balance != null && cash_balance < 0) return fail(res, 400, 'Saldo cash tidak boleh minus');
+    if (bank_balance != null && bank_balance < 0) return fail(res, 400, 'Saldo rekening tidak boleh minus');
+    if (default_admin_fee < 0) return fail(res, 400, 'Biaya admin tidak valid');
+
+    await conn.beginTransaction();
+    const oldBal = await getOrCreateMiniAtmBalances(conn, bid);
+    await conn.query(
+      `UPDATE mini_atm_branch_balances SET
+        cash_balance = COALESCE(:cash, cash_balance),
+        bank_balance = COALESCE(:bank, bank_balance),
+        default_admin_fee = :daf
+       WHERE branch_id = :bid`,
+      {
+        bid,
+        cash: cash_balance,
+        bank: bank_balance,
+        daf: default_admin_fee,
+      }
+    );
+    const [newRows] = await conn.query(`SELECT * FROM mini_atm_branch_balances WHERE branch_id = :bid`, { bid });
+    await logMiniAtmAudit(conn, {
+      branchId: bid,
+      userId: req.user.id,
+      entity: 'mini_atm_branch_balances',
+      entityId: bid,
+      action: 'update',
+      oldData: oldBal,
+      newData: newRows[0],
+      ip: req.ip,
+    });
+    await conn.commit();
+    return ok(res, newRows[0], 'Saldo Mini ATM diperbarui');
+  } catch (e) {
+    await conn.rollback();
+    return fail(res, 500, e.message);
+  } finally {
+    conn.release();
+  }
+});
+
+app.get('/api/mini-atm/transactions', authMiddleware, requireRoles('super_admin', 'admin_cabang', 'kasir', 'karyawan'), async (req, res) => {
+  try {
+    const bid = resolveMiniAtmBranchId(req);
+    if (!bid) return fail(res, 400, 'Cabang wajib dipilih');
+    const { page, limit, offset, search, sort, order } = parsePagination(req.query);
+    const from = (req.query.from || '').toString().slice(0, 10);
+    const to = (req.query.to || '').toString().slice(0, 10);
+    const txType = (req.query.transaction_type || '').toString().trim();
+    const cardStatus = (req.query.card_status || '').toString().trim();
+
+    let where = ' WHERE t.branch_id = :bid ';
+    const params = { bid, limit, offset };
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
+      where += ' AND DATE(t.transaction_at) >= :from ';
+      params.from = from;
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      where += ' AND DATE(t.transaction_at) <= :to ';
+      params.to = to;
+    }
+    if (txType === 'tarik_tunai' || txType === 'transfer') {
+      where += ' AND t.transaction_type = :txType ';
+      params.txType = txType;
+    }
+    if (cardStatus === 'pakai_kartu' || cardStatus === 'tanpa_kartu') {
+      where += ' AND t.card_status = :cardStatus ';
+      params.cardStatus = cardStatus;
+    }
+    if (search) {
+      where += ` AND (t.transaction_number LIKE :s OR t.notes LIKE :s OR u.full_name LIKE :s) `;
+      params.s = `%${search}%`;
+    }
+
+    const sortMap = {
+      id: 't.id',
+      transaction_at: 't.transaction_at',
+      nominal: 't.nominal',
+      transaction_type: 't.transaction_type',
+    };
+    const sortCol = sortMap[sort] || 't.transaction_at';
+
+    const [rows] = await pool.query(
+      `SELECT SQL_CALC_FOUND_ROWS t.*, u.full_name AS user_name, b.name AS branch_name
+       FROM mini_atm_transactions t
+       LEFT JOIN users u ON u.id = t.user_id
+       JOIN branches b ON b.id = t.branch_id
+       ${where}
+       ORDER BY ${sortCol} ${order}
+       LIMIT :limit OFFSET :offset`,
+      params
+    );
+    const [[{ total }]] = await pool.query('SELECT FOUND_ROWS() AS total');
+    return ok(
+      res,
+      rows.map(mapMiniAtmTxRow),
+      '',
+      { page, limit, total, totalPages: Math.ceil(total / limit) || 1 }
+    );
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.post('/api/mini-atm/transactions', authMiddleware, requireRoles('super_admin', 'admin_cabang', 'kasir'), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const bid = resolveMiniAtmBranchId(req, req.body.branch_id);
+    if (!bid) return fail(res, 400, 'Cabang wajib');
+    if (req.user.role_slug === 'admin_cabang' && Number(req.user.branch_id) !== bid) {
+      return fail(res, 403, 'Hanya cabang sendiri');
+    }
+
+    const transaction_type = String(req.body.transaction_type || '').trim();
+    const card_status = String(req.body.card_status || '').trim();
+    const admin_fee_type = String(req.body.admin_fee_type || '').trim();
+    const nominal = Number(req.body.nominal);
+    const admin_fee =
+      req.body.admin_fee != null && req.body.admin_fee !== ''
+        ? Number(req.body.admin_fee)
+        : MINI_ATM_DEFAULT_ADMIN_FEE;
+    const notes = String(req.body.notes || '').trim().slice(0, 2000);
+
+    if (transaction_type !== 'tarik_tunai' && transaction_type !== 'transfer') {
+      return fail(res, 400, 'Jenis transaksi wajib dipilih');
+    }
+    if (card_status !== 'pakai_kartu' && card_status !== 'tanpa_kartu') {
+      return fail(res, 400, 'Status kartu wajib dipilih');
+    }
+    if (admin_fee_type !== 'potong_dalam' && admin_fee_type !== 'potong_luar') {
+      return fail(res, 400, 'Keterangan biaya admin wajib dipilih');
+    }
+    if (!Number.isFinite(nominal) || nominal <= 0) return fail(res, 400, 'Nominal wajib diisi dan lebih dari 0');
+    if (!Number.isFinite(admin_fee) || admin_fee < 0) return fail(res, 400, 'Biaya admin tidak valid');
+
+    const { cashDelta, bankDelta } = computeMiniAtmDeltas({
+      transactionType: transaction_type,
+      cardStatus: card_status,
+      nominal,
+      adminFee: admin_fee,
+      adminFeeType: admin_fee_type,
+    });
+
+    await conn.beginTransaction();
+    const bal = await getOrCreateMiniAtmBalances(conn, bid, { forUpdate: true });
+    const opening_cash = Number(bal.cash_balance) || 0;
+    const opening_bank = Number(bal.bank_balance) || 0;
+    const closing_cash = opening_cash + cashDelta;
+    const closing_bank = opening_bank + bankDelta;
+
+    if (closing_cash < 0) {
+      await conn.rollback();
+      return fail(res, 400, `Saldo cash tidak mencukupi. Saldo saat ini ${opening_cash}, dibutuhkan ${Math.abs(Math.min(0, cashDelta))}`);
+    }
+    if (closing_bank < 0) {
+      await conn.rollback();
+      return fail(res, 400, `Saldo rekening tidak mencukupi. Saldo saat ini ${opening_bank}, dibutuhkan ${Math.abs(Math.min(0, bankDelta))}`);
+    }
+
+    const txNum = miniAtmTxNumber();
+    const [ins] = await conn.query(
+      `INSERT INTO mini_atm_transactions
+       (branch_id, user_id, transaction_number, transaction_type, card_status, nominal, admin_fee, admin_fee_type,
+        opening_cash, closing_cash, opening_bank, closing_bank, cash_delta, bank_delta, notes, transaction_at)
+       VALUES (:bid, :uid, :txnum, :tt, :cs, :nom, :af, :aft, :oc, :cc, :ob, :cb, :cd, :bd, :notes, NOW())`,
+      {
+        bid,
+        uid: req.user.id,
+        txnum: txNum,
+        tt: transaction_type,
+        cs: card_status,
+        nom: nominal,
+        af: admin_fee,
+        aft: admin_fee_type,
+        oc: opening_cash,
+        cc: closing_cash,
+        ob: opening_bank,
+        cb: closing_bank,
+        cd: cashDelta,
+        bd: bankDelta,
+        notes: notes || null,
+      }
+    );
+
+    await conn.query(
+      `UPDATE mini_atm_branch_balances SET cash_balance = :cc, bank_balance = :cb WHERE branch_id = :bid`,
+      { cc: closing_cash, cb: closing_bank, bid }
+    );
+
+    const [created] = await conn.query(
+      `SELECT t.*, u.full_name AS user_name FROM mini_atm_transactions t
+       LEFT JOIN users u ON u.id = t.user_id WHERE t.id = :id`,
+      { id: ins.insertId }
+    );
+    const row = mapMiniAtmTxRow(created[0]);
+    await logMiniAtmAudit(conn, {
+      branchId: bid,
+      userId: req.user.id,
+      entityId: ins.insertId,
+      action: 'create',
+      oldData: null,
+      newData: row,
+      ip: req.ip,
+    });
+    await logActivity(req.user.id, 'create', 'mini_atm_transaction', ins.insertId, { transaction_number: txNum }, req.ip);
+    await conn.commit();
+    return ok(res, row, 'Transaksi Mini ATM disimpan');
+  } catch (e) {
+    await conn.rollback();
+    return fail(res, 500, e.message);
+  } finally {
+    conn.release();
+  }
+});
+
+app.put('/api/mini-atm/transactions/:id', authMiddleware, requireRoles('super_admin', 'admin_cabang'), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return fail(res, 400, 'ID tidak valid');
+
+    const [existingRows] = await conn.query(`SELECT * FROM mini_atm_transactions WHERE id = :id`, { id });
+    if (!existingRows[0]) return fail(res, 404, 'Transaksi tidak ditemukan');
+    const existing = existingRows[0];
+    const bid = Number(existing.branch_id);
+    if (req.user.role_slug === 'admin_cabang' && Number(req.user.branch_id) !== bid) {
+      return fail(res, 403, 'Hanya cabang sendiri');
+    }
+
+    const transaction_type = String(req.body.transaction_type || existing.transaction_type).trim();
+    const card_status = String(req.body.card_status || existing.card_status).trim();
+    const admin_fee_type = String(req.body.admin_fee_type || existing.admin_fee_type).trim();
+    const nominal = req.body.nominal != null ? Number(req.body.nominal) : Number(existing.nominal);
+    const admin_fee = req.body.admin_fee != null ? Number(req.body.admin_fee) : Number(existing.admin_fee);
+    const notes = req.body.notes != null ? String(req.body.notes).trim().slice(0, 2000) : existing.notes;
+
+    if (transaction_type !== 'tarik_tunai' && transaction_type !== 'transfer') {
+      return fail(res, 400, 'Jenis transaksi tidak valid');
+    }
+    if (card_status !== 'pakai_kartu' && card_status !== 'tanpa_kartu') {
+      return fail(res, 400, 'Status kartu tidak valid');
+    }
+    if (admin_fee_type !== 'potong_dalam' && admin_fee_type !== 'potong_luar') {
+      return fail(res, 400, 'Keterangan biaya admin tidak valid');
+    }
+    if (!Number.isFinite(nominal) || nominal <= 0) return fail(res, 400, 'Nominal harus lebih dari 0');
+
+    const { cashDelta, bankDelta } = computeMiniAtmDeltas({
+      transactionType: transaction_type,
+      cardStatus: card_status,
+      nominal,
+      adminFee: admin_fee,
+      adminFeeType: admin_fee_type,
+    });
+
+    await conn.beginTransaction();
+    const bal = await getOrCreateMiniAtmBalances(conn, bid, { forUpdate: true });
+    let cash = Number(bal.cash_balance) - Number(existing.cash_delta);
+    let bank = Number(bal.bank_balance) - Number(existing.bank_delta);
+    const opening_cash = cash;
+    const opening_bank = bank;
+    const closing_cash = cash + cashDelta;
+    const closing_bank = bank + bankDelta;
+
+    if (closing_cash < 0) {
+      await conn.rollback();
+      return fail(res, 400, 'Saldo cash tidak mencukupi setelah perubahan transaksi');
+    }
+    if (closing_bank < 0) {
+      await conn.rollback();
+      return fail(res, 400, 'Saldo rekening tidak mencukupi setelah perubahan transaksi');
+    }
+
+    await conn.query(
+      `UPDATE mini_atm_transactions SET
+        transaction_type = :tt, card_status = :cs, nominal = :nom, admin_fee = :af, admin_fee_type = :aft,
+        opening_cash = :oc, closing_cash = :cc, opening_bank = :ob, closing_bank = :cb,
+        cash_delta = :cd, bank_delta = :bd, notes = :notes
+       WHERE id = :id`,
+      {
+        id,
+        tt: transaction_type,
+        cs: card_status,
+        nom: nominal,
+        af: admin_fee,
+        aft: admin_fee_type,
+        oc: opening_cash,
+        cc: closing_cash,
+        ob: opening_bank,
+        cb: closing_bank,
+        cd: cashDelta,
+        bd: bankDelta,
+        notes: notes || null,
+      }
+    );
+
+    await conn.query(
+      `UPDATE mini_atm_branch_balances SET cash_balance = :cc, bank_balance = :cb WHERE branch_id = :bid`,
+      { cc: closing_cash, cb: closing_bank, bid }
+    );
+
+    const [updated] = await conn.query(
+      `SELECT t.*, u.full_name AS user_name FROM mini_atm_transactions t
+       LEFT JOIN users u ON u.id = t.user_id WHERE t.id = :id`,
+      { id }
+    );
+    const row = mapMiniAtmTxRow(updated[0]);
+    await logMiniAtmAudit(conn, {
+      branchId: bid,
+      userId: req.user.id,
+      entityId: id,
+      action: 'update',
+      oldData: mapMiniAtmTxRow(existing),
+      newData: row,
+      ip: req.ip,
+    });
+    await logActivity(req.user.id, 'update', 'mini_atm_transaction', id, { transaction_number: existing.transaction_number }, req.ip);
+    await conn.commit();
+    return ok(res, row, 'Transaksi diperbarui');
+  } catch (e) {
+    await conn.rollback();
+    return fail(res, 500, e.message);
+  } finally {
+    conn.release();
+  }
+});
+
+app.delete('/api/mini-atm/transactions/:id', authMiddleware, requireRoles('super_admin', 'admin_cabang'), async (req, res) => {
+  const conn = await pool.getConnection();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return fail(res, 400, 'ID tidak valid');
+
+    const [existingRows] = await conn.query(`SELECT * FROM mini_atm_transactions WHERE id = :id`, { id });
+    if (!existingRows[0]) return fail(res, 404, 'Transaksi tidak ditemukan');
+    const existing = existingRows[0];
+    const bid = Number(existing.branch_id);
+    if (req.user.role_slug === 'admin_cabang' && Number(req.user.branch_id) !== bid) {
+      return fail(res, 403, 'Hanya cabang sendiri');
+    }
+
+    await conn.beginTransaction();
+    const bal = await getOrCreateMiniAtmBalances(conn, bid, { forUpdate: true });
+    const closing_cash = Number(bal.cash_balance) - Number(existing.cash_delta);
+    const closing_bank = Number(bal.bank_balance) - Number(existing.bank_delta);
+    if (closing_cash < 0 || closing_bank < 0) {
+      await conn.rollback();
+      return fail(res, 400, 'Tidak bisa menghapus: saldo menjadi minus');
+    }
+
+    await conn.query(`DELETE FROM mini_atm_transactions WHERE id = :id`, { id });
+    await conn.query(
+      `UPDATE mini_atm_branch_balances SET cash_balance = :cc, bank_balance = :cb WHERE branch_id = :bid`,
+      { cc: closing_cash, cb: closing_bank, bid }
+    );
+
+    await logMiniAtmAudit(conn, {
+      branchId: bid,
+      userId: req.user.id,
+      entityId: id,
+      action: 'delete',
+      oldData: mapMiniAtmTxRow(existing),
+      newData: null,
+      ip: req.ip,
+    });
+    await logActivity(req.user.id, 'delete', 'mini_atm_transaction', id, { transaction_number: existing.transaction_number }, req.ip);
+    await conn.commit();
+    return ok(res, null, 'Transaksi dihapus');
+  } catch (e) {
+    await conn.rollback();
+    return fail(res, 500, e.message);
+  } finally {
+    conn.release();
+  }
+});
+
+app.get('/api/mini-atm/audit-logs', authMiddleware, requireRoles('super_admin', 'admin_cabang'), async (req, res) => {
+  try {
+    const bid = resolveMiniAtmBranchId(req);
+    if (!bid) return fail(res, 400, 'Cabang wajib dipilih');
+    if (req.user.role_slug === 'admin_cabang' && Number(req.user.branch_id) !== bid) {
+      return fail(res, 403, 'Hanya cabang sendiri');
+    }
+    const { page, limit, offset } = parsePagination(req.query);
+    const [rows] = await pool.query(
+      `SELECT SQL_CALC_FOUND_ROWS a.*, u.full_name AS user_name
+       FROM mini_atm_audit_logs a
+       LEFT JOIN users u ON u.id = a.user_id
+       WHERE a.branch_id = :bid
+       ORDER BY a.id DESC
+       LIMIT :limit OFFSET :offset`,
+      { bid, limit, offset }
+    );
+    const [[{ total }]] = await pool.query('SELECT FOUND_ROWS() AS total');
+    const mapped = rows.map((r) => ({
+      ...r,
+      old_data: r.old_data ? (typeof r.old_data === 'string' ? JSON.parse(r.old_data) : r.old_data) : null,
+      new_data: r.new_data ? (typeof r.new_data === 'string' ? JSON.parse(r.new_data) : r.new_data) : null,
+    }));
+    return ok(res, mapped, '', { page, limit, total, totalPages: Math.ceil(total / limit) || 1 });
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
 app.use((err, _req, res, _next) => {
   console.error(err);
   return fail(res, 500, err.message || 'Server error');

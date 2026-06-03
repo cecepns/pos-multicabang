@@ -23,6 +23,7 @@ import WalletChannelsPage from '@/pages/WalletChannelsPage';
 import WalletChannelProductsPage from '@/pages/WalletChannelProductsPage';
 import WalletSalesPage from '@/pages/WalletSalesPage';
 import WalletBranchSaldoPage from '@/pages/WalletBranchSaldoPage';
+import MiniAtmPage from '@/pages/MiniAtmPage';
 
 export default function App() {
   return (
@@ -50,6 +51,7 @@ export default function App() {
         <Route path="wallet-channels" element={<ProtectedRoute roles={['super_admin', 'admin_cabang']}><WalletChannelsPage /></ProtectedRoute>} />
         <Route path="wallet-channel-products" element={<ProtectedRoute roles={['super_admin', 'admin_cabang', 'kasir']}><WalletChannelProductsPage /></ProtectedRoute>} />
         <Route path="wallet-branch-saldo" element={<ProtectedRoute roles={['super_admin', 'admin_cabang']}><WalletBranchSaldoPage /></ProtectedRoute>} />
+        <Route path="mini-atm" element={<ProtectedRoute roles={['super_admin', 'admin_cabang', 'kasir', 'karyawan']}><MiniAtmPage /></ProtectedRoute>} />
         <Route path="stock-central" element={<ProtectedRoute roles={['super_admin', 'admin_cabang']}><StockCentralPage /></ProtectedRoute>} />
         <Route path="stock-branch" element={<StockBranchPage />} />
         <Route path="transfers" element={<ProtectedRoute roles={['super_admin', 'admin_cabang', 'kasir']}><TransfersPage /></ProtectedRoute>} />

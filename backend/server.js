@@ -6,10 +6,41 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 require('dotenv/config');
 
-/** Zona waktu operasional (cabang Sulawesi — WITA). Wajib selaras dengan MySQL session. */
+/** Zona waktu operasional (cabang Sulawesi — WITA). */
 const APP_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Makassar';
-const DB_TIMEZONE = process.env.DB_TIMEZONE || '+08:00';
 process.env.TZ = APP_TIMEZONE;
+
+/** Jam dinding WITA/WIB untuk disimpan ke kolom DATETIME MySQL (tanpa NOW()/UTC) */
+function wallClockNow(tz = APP_TIMEZONE) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date());
+  const g = (type) => parts.find((p) => p.type === type)?.value.padStart(2, '0');
+  return {
+    date: `${g('year')}-${g('month')}-${g('day')}`,
+    datetime: `${g('year')}-${g('month')}-${g('day')} ${g('hour')}:${g('minute')}:${g('second')}`,
+  };
+}
+
+function parseWallClockDatetime(value) {
+  const m = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return null;
+  return {
+    y: Number(m[1]),
+    mo: Number(m[2]),
+    d: Number(m[3]),
+    h: Number(m[4]),
+    mi: Number(m[5]),
+    s: Number(m[6]),
+  };
+}
 
 const express = require('express');
 const cors = require('cors');
@@ -40,12 +71,21 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   namedPlaceholders: true,
-  timezone: DB_TIMEZONE,
 });
 
-pool.pool?.on?.('connection', (conn) => {
-  conn.query(`SET time_zone = '${DB_TIMEZONE}'`);
-});
+/** DATETIME MySQL → string jam dinding (kolom disimpan sebagai jam lokal, bukan UTC) */
+function sqlFmtDt(column) {
+  return `DATE_FORMAT(${column}, '%Y-%m-%d %H:%i:%s')`;
+}
+
+const SQL_ATTENDANCE_SELECT = `
+  a.id, a.employee_id, a.branch_id, a.work_shift_id,
+  ${sqlFmtDt('a.clock_in_at')} AS clock_in_at,
+  ${sqlFmtDt('a.clock_out_at')} AS clock_out_at,
+  a.latitude_in, a.longitude_in, a.latitude_out, a.longitude_out,
+  a.distance_in_meters, a.status, a.late_minutes, a.notes,
+  ${sqlFmtDt('a.created_at')} AS created_at,
+  ${sqlFmtDt('a.updated_at')} AS updated_at`;
 
 const app = express();
 app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
@@ -175,32 +215,92 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
   return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
-/** Menit keterlambatan: max(0, clock_in - (time_in + grace)) pada tanggal yang sama (zona APP_TIMEZONE) */
+/** Menit keterlambatan dari jam dinding (string DATETIME lokal) */
 function computeShiftLateMinutes(clockInAt, shiftTimeIn, graceInMinutes) {
-  const ci = clockInAt instanceof Date ? clockInAt : new Date(clockInAt);
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: APP_TIMEZONE,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  }).formatToParts(ci);
-  const get = (type) => Number(parts.find((p) => p.type === type)?.value || 0);
-  const y = get('year');
-  const mo = get('month');
-  const d = get('day');
+  let p = typeof clockInAt === 'string' ? parseWallClockDatetime(clockInAt) : null;
+  if (!p) {
+    const ci = clockInAt instanceof Date ? clockInAt : new Date(clockInAt);
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: APP_TIMEZONE,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).formatToParts(ci);
+    const get = (type) => Number(parts.find((x) => x.type === type)?.value || 0);
+    p = { y: get('year'), mo: get('month'), d: get('day'), h: get('hour'), mi: get('minute'), s: get('second') };
+  }
   const t = String(shiftTimeIn || '08:00:00');
   const tp = t.split(':');
   const hh = parseInt(tp[0], 10) || 0;
   const mm = parseInt(tp[1], 10) || 0;
   const ss = parseInt(tp[2], 10) || 0;
-  const deadline = new Date(y, mo - 1, d, hh, mm, ss, 0);
+  const deadline = new Date(p.y, p.mo - 1, p.d, hh, mm, ss, 0);
   deadline.setMinutes(deadline.getMinutes() + (Number(graceInMinutes) || 0));
-  const ciLocal = new Date(y, mo - 1, d, get('hour'), get('minute'), get('second'));
+  const ciLocal = new Date(p.y, p.mo - 1, p.d, p.h, p.mi, p.s);
   return Math.max(0, Math.floor((ciLocal.getTime() - deadline.getTime()) / 60000));
+}
+
+function normalizeWallClockDatetimeInput(v) {
+  if (v == null || v === '') return null;
+  let s = String(v).trim().replace('T', ' ');
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s)) s += ':00';
+  if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) return null;
+  return s;
+}
+
+async function getEmployeeForAdminAttendance(poolConn, employeeId, req, workShiftIdOverride = null) {
+  const [rows] = await poolConn.query(
+    `SELECT e.id, e.user_id, e.branch_id, e.work_shift_id, e.employee_code,
+            b.latitude AS blat, b.longitude AS blng
+     FROM employees e
+     JOIN branches b ON b.id = e.branch_id
+     WHERE e.id = :eid LIMIT 1`,
+    { eid: employeeId }
+  );
+  const emp = rows[0];
+  if (!emp) return null;
+  if (req.user.role_slug === 'admin_cabang' && Number(req.user.branch_id) !== Number(emp.branch_id)) {
+    return { forbidden: true };
+  }
+  const wsid = workShiftIdOverride || emp.work_shift_id;
+  let shift = null;
+  if (wsid) {
+    const [ws] = await poolConn.query(
+      `SELECT id, time_in, grace_in_minutes, branch_id FROM work_shifts WHERE id = :id LIMIT 1`,
+      { id: wsid }
+    );
+    shift = ws[0] || null;
+    if (shift && req.user.role_slug === 'admin_cabang' && Number(shift.branch_id) !== Number(req.user.branch_id)) {
+      return { forbidden: true };
+    }
+  }
+  return { ...emp, work_shift_id: wsid || null, shift };
+}
+
+async function fetchAttendanceById(poolConn, id) {
+  const [rows] = await poolConn.query(
+    `SELECT ${SQL_ATTENDANCE_SELECT}, e.employee_code, u.full_name, b.name AS branch_name, ws.name AS shift_name
+     FROM attendances a
+     JOIN employees e ON e.id = a.employee_id
+     JOIN users u ON u.id = e.user_id
+     JOIN branches b ON b.id = a.branch_id
+     LEFT JOIN work_shifts ws ON ws.id = a.work_shift_id
+     WHERE a.id = :id LIMIT 1`,
+    { id }
+  );
+  return rows[0] || null;
+}
+
+function resolveAttendanceStatus(lateMin, explicitStatus) {
+  const lm = Math.max(0, Number(lateMin) || 0);
+  if (explicitStatus === 'tidak_hadir') return { status: 'tidak_hadir', late_minutes: lm };
+  if (explicitStatus === 'telat') return { status: 'telat', late_minutes: lm };
+  if (explicitStatus === 'hadir') return { status: 'hadir', late_minutes: lm };
+  return { status: lm > 0 ? 'telat' : 'hadir', late_minutes: lm };
 }
 
 /** Buat baris employees otomatis untuk user cabang (kasir/karyawan) agar absensi bisa dipakai */
@@ -2375,9 +2475,10 @@ app.get('/api/attendances/context', authMiddleware, requireRoles('karyawan', 'ka
     } else if (emp.work_shift_id) {
       shift = { inactive: true, message: 'Shift dinonaktifkan — hubungi admin.' };
     }
+    const { date: todayWita } = wallClockNow();
     const [open] = await pool.query(
-      `SELECT id, clock_in_at FROM attendances WHERE employee_id=:eid AND DATE(clock_in_at)=CURDATE() AND clock_out_at IS NULL ORDER BY id DESC LIMIT 1`,
-      { eid: emp.id }
+      `SELECT id, ${sqlFmtDt('clock_in_at')} AS clock_in_at FROM attendances WHERE employee_id=:eid AND DATE(clock_in_at)=:todayWita AND clock_out_at IS NULL ORDER BY id DESC LIMIT 1`,
+      { eid: emp.id, todayWita }
     );
     return ok(
       res,
@@ -2413,7 +2514,7 @@ app.get('/api/attendances', authMiddleware, async (req, res) => {
     }
     const sortCol = ['id', 'clock_in_at', 'status'].includes(sort) ? `a.${sort}` : 'a.id';
     const [rows] = await pool.query(
-      `SELECT SQL_CALC_FOUND_ROWS a.*, e.employee_code, u.full_name, b.name AS branch_name, ws.name AS shift_name
+      `SELECT SQL_CALC_FOUND_ROWS ${SQL_ATTENDANCE_SELECT}, e.employee_code, u.full_name, b.name AS branch_name, ws.name AS shift_name
        FROM attendances a
        JOIN employees e ON e.id = a.employee_id
        JOIN users u ON u.id = e.user_id
@@ -2440,9 +2541,10 @@ app.post('/api/attendances/clock-in', authMiddleware, requireRoles('karyawan', '
     if (dist > Number(emp.rad)) {
       return fail(res, 400, `Di luar radius cabang (~${Math.round(dist)}m, max ${emp.rad}m)`);
     }
+    const { date: todayWita, datetime: nowWita } = wallClockNow();
     const [open] = await pool.query(
-      `SELECT id FROM attendances WHERE employee_id=:eid AND DATE(clock_in_at)=CURDATE() AND clock_out_at IS NULL`,
-      { eid: emp.id }
+      `SELECT id FROM attendances WHERE employee_id=:eid AND DATE(clock_in_at)=:todayWita AND clock_out_at IS NULL`,
+      { eid: emp.id, todayWita }
     );
     if (open[0]) return fail(res, 400, 'Sudah clock in hari ini');
     if (!emp.work_shift_id || !emp.ws_id || !emp.ws_is_active) {
@@ -2454,16 +2556,16 @@ app.post('/api/attendances/clock-in', authMiddleware, requireRoles('karyawan', '
           : 'Shift Anda nonaktif — hubungi admin cabang.'
       );
     }
-    const now = new Date();
-    const lateMin = computeShiftLateMinutes(now, emp.ws_time_in, emp.ws_grace_in);
+    const lateMin = computeShiftLateMinutes(nowWita, emp.ws_time_in, emp.ws_grace_in);
     const status = lateMin > 0 ? 'telat' : 'hadir';
     const [ins] = await pool.query(
       `INSERT INTO attendances (employee_id, branch_id, work_shift_id, clock_in_at, latitude_in, longitude_in, distance_in_meters, status, late_minutes)
-       VALUES (:eid, :bid, :wsid, NOW(), :lat, :lng, :dist, :st, :lm)`,
+       VALUES (:eid, :bid, :wsid, :nowWita, :lat, :lng, :dist, :st, :lm)`,
       {
         eid: emp.id,
         bid: emp.branch_id,
         wsid: emp.work_shift_id,
+        nowWita,
         lat: latitude,
         lng: longitude,
         dist: Math.round(dist),
@@ -2487,16 +2589,226 @@ app.post('/api/attendances/clock-out', authMiddleware, requireRoles('karyawan', 
     const [b] = await pool.query(`SELECT latitude, longitude, attendance_radius_meters AS rad FROM branches WHERE id=:id`, { id: emp.branch_id });
     const dist = distanceMeters(Number(latitude), Number(longitude), Number(b[0].latitude), Number(b[0].longitude));
     if (dist > Number(b[0].rad)) return fail(res, 400, 'Clock out di luar radius');
+    const { date: todayWita, datetime: nowWita } = wallClockNow();
     const [open] = await pool.query(
-      `SELECT id FROM attendances WHERE employee_id=:eid AND DATE(clock_in_at)=CURDATE() AND clock_out_at IS NULL ORDER BY id DESC LIMIT 1`,
-      { eid: emp.id }
+      `SELECT id FROM attendances WHERE employee_id=:eid AND DATE(clock_in_at)=:todayWita AND clock_out_at IS NULL ORDER BY id DESC LIMIT 1`,
+      { eid: emp.id, todayWita }
     );
     if (!open[0]) return fail(res, 400, 'Tidak ada sesi clock in aktif');
     await pool.query(
-      `UPDATE attendances SET clock_out_at=NOW(), latitude_out=:lat, longitude_out=:lng WHERE id=:id`,
-      { id: open[0].id, lat: latitude, lng: longitude }
+      `UPDATE attendances SET clock_out_at=:nowWita, latitude_out=:lat, longitude_out=:lng WHERE id=:id`,
+      { id: open[0].id, nowWita, lat: latitude, lng: longitude }
     );
     return ok(res, { id: open[0].id }, 'Clock out berhasil');
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.get('/api/attendances/form-options', authMiddleware, requireRoles('super_admin', 'admin_cabang'), async (req, res) => {
+  try {
+    let branchId =
+      req.query.branch_id != null && req.query.branch_id !== '' ? Number(req.query.branch_id) : null;
+    if (req.user.role_slug === 'admin_cabang') branchId = Number(req.user.branch_id) || null;
+
+    let branches = [];
+    if (req.user.role_slug === 'super_admin') {
+      const [br] = await pool.query(`SELECT id, code, name FROM branches ORDER BY name`);
+      branches = br;
+      if (!branchId && branches[0]) branchId = branches[0].id;
+    }
+
+    let empWhere = ' WHERE 1=1 ';
+    const params = {};
+    if (branchId) {
+      empWhere += ' AND e.branch_id = :bid ';
+      params.bid = branchId;
+    }
+    const [employees] = await pool.query(
+      `SELECT e.id, e.employee_code, e.branch_id, e.work_shift_id, u.full_name, b.name AS branch_name,
+              ws.name AS shift_name
+       FROM employees e
+       JOIN users u ON u.id = e.user_id
+       JOIN branches b ON b.id = e.branch_id
+       LEFT JOIN work_shifts ws ON ws.id = e.work_shift_id
+       ${empWhere}
+       ORDER BY u.full_name`,
+      params
+    );
+
+    let shifts = [];
+    if (branchId) {
+      const [sh] = await pool.query(
+        `SELECT id, name, time_in, time_out, grace_in_minutes, is_active
+         FROM work_shifts WHERE branch_id = :bid ORDER BY name`,
+        { bid: branchId }
+      );
+      shifts = sh;
+    }
+
+    return ok(res, { branches, employees, shifts, branch_id: branchId }, '');
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.post('/api/attendances', authMiddleware, requireRoles('super_admin', 'admin_cabang'), async (req, res) => {
+  try {
+    const employee_id = Number(req.body.employee_id);
+    const work_shift_id =
+      req.body.work_shift_id != null && req.body.work_shift_id !== '' ? Number(req.body.work_shift_id) : null;
+    const clock_in_at = normalizeWallClockDatetimeInput(req.body.clock_in_at);
+    const clock_out_at = normalizeWallClockDatetimeInput(req.body.clock_out_at);
+    const notes = String(req.body.notes || '').trim().slice(0, 255) || null;
+    const statusOverride = String(req.body.status || '').trim() || null;
+
+    if (!employee_id) return fail(res, 400, 'Karyawan wajib dipilih');
+    if (!clock_in_at) return fail(res, 400, 'Jam masuk wajib (format: YYYY-MM-DD HH:mm:ss)');
+    if (clock_out_at && clock_out_at <= clock_in_at) return fail(res, 400, 'Jam keluar harus setelah jam masuk');
+
+    const empCtx = await getEmployeeForAdminAttendance(pool, employee_id, req, work_shift_id);
+    if (!empCtx) return fail(res, 404, 'Karyawan tidak ditemukan');
+    if (empCtx.forbidden) return fail(res, 403, 'Karyawan di luar cabang Anda');
+
+    const wsid = work_shift_id || empCtx.work_shift_id || null;
+    let lateMin = 0;
+    if (empCtx.shift?.time_in) {
+      lateMin = computeShiftLateMinutes(clock_in_at, empCtx.shift.time_in, empCtx.shift.grace_in_minutes);
+    }
+    if (req.body.late_minutes != null && req.body.late_minutes !== '') {
+      lateMin = Math.max(0, Number(req.body.late_minutes) || 0);
+    }
+    const { status, late_minutes } = resolveAttendanceStatus(lateMin, statusOverride);
+
+    const lat = empCtx.blat != null ? empCtx.blat : 0;
+    const lng = empCtx.blng != null ? empCtx.blng : 0;
+
+    const [ins] = await pool.query(
+      `INSERT INTO attendances
+       (employee_id, branch_id, work_shift_id, clock_in_at, clock_out_at, latitude_in, longitude_in,
+        latitude_out, longitude_out, distance_in_meters, status, late_minutes, notes)
+       VALUES (:eid, :bid, :wsid, :cin, :cout, :lat, :lng, :latout, :lngout, 0, :st, :lm, :notes)`,
+      {
+        eid: employee_id,
+        bid: empCtx.branch_id,
+        wsid,
+        cin: clock_in_at,
+        cout: clock_out_at,
+        lat,
+        lng,
+        latout: clock_out_at ? lat : null,
+        lngout: clock_out_at ? lng : null,
+        st: status,
+        lm: late_minutes,
+        notes,
+      }
+    );
+
+    await logActivity(req.user.id, 'create', 'attendance', ins.insertId, { employee_id, manual: true }, req.ip);
+    const row = await fetchAttendanceById(pool, ins.insertId);
+    return ok(res, row, 'Absensi ditambahkan');
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.put('/api/attendances/:id', authMiddleware, requireRoles('super_admin', 'admin_cabang'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return fail(res, 400, 'ID tidak valid');
+
+    const existing = await fetchAttendanceById(pool, id);
+    if (!existing) return fail(res, 404, 'Absensi tidak ditemukan');
+    if (req.user.role_slug === 'admin_cabang' && Number(req.user.branch_id) !== Number(existing.branch_id)) {
+      return fail(res, 403, 'Hanya cabang sendiri');
+    }
+
+    const work_shift_id =
+      req.body.work_shift_id != null && req.body.work_shift_id !== ''
+        ? Number(req.body.work_shift_id)
+        : existing.work_shift_id;
+    const clock_in_at =
+      req.body.clock_in_at != null ? normalizeWallClockDatetimeInput(req.body.clock_in_at) : existing.clock_in_at;
+    const clock_out_at =
+      req.body.clock_out_at === null || req.body.clock_out_at === ''
+        ? null
+        : req.body.clock_out_at != null
+          ? normalizeWallClockDatetimeInput(req.body.clock_out_at)
+          : existing.clock_out_at;
+    const notes =
+      req.body.notes !== undefined ? String(req.body.notes || '').trim().slice(0, 255) || null : existing.notes;
+    const statusOverride = req.body.status != null ? String(req.body.status).trim() : null;
+
+    if (!clock_in_at) return fail(res, 400, 'Jam masuk tidak valid');
+    if (clock_out_at && clock_out_at <= clock_in_at) return fail(res, 400, 'Jam keluar harus setelah jam masuk');
+
+    let shift = null;
+    if (work_shift_id) {
+      const [ws] = await pool.query(`SELECT id, time_in, grace_in_minutes, branch_id FROM work_shifts WHERE id=:id`, {
+        id: work_shift_id,
+      });
+      shift = ws[0];
+      if (!shift) return fail(res, 400, 'Shift tidak valid');
+      if (req.user.role_slug === 'admin_cabang' && Number(shift.branch_id) !== Number(existing.branch_id)) {
+        return fail(res, 403, 'Shift bukan cabang ini');
+      }
+    }
+
+    let lateMin = 0;
+    if (shift?.time_in) {
+      lateMin = computeShiftLateMinutes(clock_in_at, shift.time_in, shift.grace_in_minutes);
+    } else if (req.body.late_minutes != null && req.body.late_minutes !== '') {
+      lateMin = Math.max(0, Number(req.body.late_minutes) || 0);
+    } else {
+      lateMin = Number(existing.late_minutes) || 0;
+    }
+    if (req.body.late_minutes != null && req.body.late_minutes !== '') {
+      lateMin = Math.max(0, Number(req.body.late_minutes) || 0);
+    }
+    const { status, late_minutes } = resolveAttendanceStatus(lateMin, statusOverride || existing.status);
+
+    await pool.query(
+      `UPDATE attendances SET
+        work_shift_id = :wsid,
+        clock_in_at = :cin,
+        clock_out_at = :cout,
+        status = :st,
+        late_minutes = :lm,
+        notes = :notes
+       WHERE id = :id`,
+      {
+        id,
+        wsid: work_shift_id,
+        cin: clock_in_at,
+        cout: clock_out_at,
+        st: status,
+        lm: late_minutes,
+        notes,
+      }
+    );
+
+    await logActivity(req.user.id, 'update', 'attendance', id, { employee_id: existing.employee_id }, req.ip);
+    const row = await fetchAttendanceById(pool, id);
+    return ok(res, row, 'Absensi diperbarui');
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.delete('/api/attendances/:id', authMiddleware, requireRoles('super_admin', 'admin_cabang'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id <= 0) return fail(res, 400, 'ID tidak valid');
+
+    const [rows] = await pool.query(`SELECT id, branch_id, employee_id FROM attendances WHERE id = :id`, { id });
+    if (!rows[0]) return fail(res, 404, 'Absensi tidak ditemukan');
+    if (req.user.role_slug === 'admin_cabang' && Number(req.user.branch_id) !== Number(rows[0].branch_id)) {
+      return fail(res, 403, 'Hanya cabang sendiri');
+    }
+
+    await pool.query(`DELETE FROM attendances WHERE id = :id`, { id });
+    await logActivity(req.user.id, 'delete', 'attendance', id, { employee_id: rows[0].employee_id }, req.ip);
+    return ok(res, null, 'Absensi dihapus');
   } catch (e) {
     return fail(res, 500, e.message);
   }
@@ -3581,7 +3893,7 @@ app.get('/api/reports/attendance', authMiddleware, requireRoles('super_admin', '
       params.s = `%${search}%`;
     }
     const [rows] = await pool.query(
-      `SELECT SQL_CALC_FOUND_ROWS a.*, u.full_name, e.employee_code, b.name AS branch_name, ws.name AS shift_name
+      `SELECT SQL_CALC_FOUND_ROWS ${SQL_ATTENDANCE_SELECT}, u.full_name, e.employee_code, b.name AS branch_name, ws.name AS shift_name
        FROM attendances a
        JOIN employees e ON e.id=a.employee_id
        JOIN users u ON u.id=e.user_id

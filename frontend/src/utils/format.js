@@ -11,8 +11,21 @@ const dateTimeFormatOpts = {
   timeZone: DISPLAY_TIMEZONE,
 };
 
+/** Parse datetime dari MySQL/API: "2026-06-06 06:22:49" = jam dinding lokal, bukan UTC */
+export function parseWallClockDateTime(value) {
+  if (value == null || value === '') return null;
+  const s = String(value).trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!m || m[4] == null) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6] || 0));
+}
+
 export function formatDate(d) {
   if (!d) return '-';
+  const local = parseWallClockDateTime(d);
+  if (local && !Number.isNaN(local.getTime())) {
+    return local.toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' });
+  }
   const x = new Date(d);
   if (Number.isNaN(x.getTime())) return '-';
   return x.toLocaleString('id-ID', dateTimeFormatOpts);
@@ -21,6 +34,16 @@ export function formatDate(d) {
 /** Untuk tabel laporan & export (Excel/PDF) — hindari string ISO mentah */
 export function formatExportDate(d) {
   if (d == null || d === '') return '';
+  const local = parseWallClockDateTime(d);
+  if (local && !Number.isNaN(local.getTime())) {
+    return local.toLocaleString('id-ID', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }
   const x = new Date(d);
   if (Number.isNaN(x.getTime())) return String(d);
   return x.toLocaleString('id-ID', {
@@ -71,7 +94,11 @@ export function formatReportPeriod(value, periodType) {
 /** Tanggal/jam untuk export Excel & PDF (bukan ISO mentah) */
 export function formatExportDateTime(value) {
   if (value == null || value === '') return '';
+  const local = parseWallClockDateTime(value);
+  if (local && !Number.isNaN(local.getTime())) {
+    return local.toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' });
+  }
   const x = new Date(value);
   if (Number.isNaN(x.getTime())) return String(value);
-  return x.toLocaleString('id-ID', { ...dateTimeFormatOpts });
+  return x.toLocaleString('id-ID', dateTimeFormatOpts);
 }

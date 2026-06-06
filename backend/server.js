@@ -5,6 +5,12 @@ import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
 require('dotenv/config');
+
+/** Zona waktu operasional (cabang Sulawesi — WITA). Wajib selaras dengan MySQL session. */
+const APP_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Makassar';
+const DB_TIMEZONE = process.env.DB_TIMEZONE || '+08:00';
+process.env.TZ = APP_TIMEZONE;
+
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -34,6 +40,11 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   namedPlaceholders: true,
+  timezone: DB_TIMEZONE,
+});
+
+pool.pool?.on?.('connection', (conn) => {
+  conn.query(`SET time_zone = '${DB_TIMEZONE}'`);
 });
 
 const app = express();
@@ -164,17 +175,32 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
   return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
-/** Menit keterlambatan: max(0, clock_in - (time_in + grace)) pada tanggal yang sama */
+/** Menit keterlambatan: max(0, clock_in - (time_in + grace)) pada tanggal yang sama (zona APP_TIMEZONE) */
 function computeShiftLateMinutes(clockInAt, shiftTimeIn, graceInMinutes) {
   const ci = clockInAt instanceof Date ? clockInAt : new Date(clockInAt);
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: APP_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(ci);
+  const get = (type) => Number(parts.find((p) => p.type === type)?.value || 0);
+  const y = get('year');
+  const mo = get('month');
+  const d = get('day');
   const t = String(shiftTimeIn || '08:00:00');
-  const parts = t.split(':');
-  const hh = parseInt(parts[0], 10) || 0;
-  const mm = parseInt(parts[1], 10) || 0;
-  const ss = parseInt(parts[2], 10) || 0;
-  const deadline = new Date(ci.getFullYear(), ci.getMonth(), ci.getDate(), hh, mm, ss, 0);
+  const tp = t.split(':');
+  const hh = parseInt(tp[0], 10) || 0;
+  const mm = parseInt(tp[1], 10) || 0;
+  const ss = parseInt(tp[2], 10) || 0;
+  const deadline = new Date(y, mo - 1, d, hh, mm, ss, 0);
   deadline.setMinutes(deadline.getMinutes() + (Number(graceInMinutes) || 0));
-  return Math.max(0, Math.floor((ci.getTime() - deadline.getTime()) / 60000));
+  const ciLocal = new Date(y, mo - 1, d, get('hour'), get('minute'), get('second'));
+  return Math.max(0, Math.floor((ciLocal.getTime() - deadline.getTime()) / 60000));
 }
 
 /** Buat baris employees otomatis untuk user cabang (kasir/karyawan) agar absensi bisa dipakai */

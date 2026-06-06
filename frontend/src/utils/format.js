@@ -3,10 +3,19 @@ export function formatCurrency(n) {
   return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(v);
 }
 
+export const DISPLAY_TIMEZONE = import.meta.env.VITE_APP_TIMEZONE || 'Asia/Makassar';
+
+const dateTimeFormatOpts = {
+  dateStyle: 'medium',
+  timeStyle: 'short',
+  timeZone: DISPLAY_TIMEZONE,
+};
+
 export function formatDate(d) {
   if (!d) return '-';
   const x = new Date(d);
-  return x.toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' });
+  if (Number.isNaN(x.getTime())) return '-';
+  return x.toLocaleString('id-ID', dateTimeFormatOpts);
 }
 
 /** Untuk tabel laporan & export (Excel/PDF) — hindari string ISO mentah */
@@ -20,6 +29,7 @@ export function formatExportDate(d) {
     year: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
+    timeZone: DISPLAY_TIMEZONE,
   });
 }
 
@@ -63,5 +73,5 @@ export function formatExportDateTime(value) {
   if (value == null || value === '') return '';
   const x = new Date(value);
   if (Number.isNaN(x.getTime())) return String(value);
-  return x.toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' });
+  return x.toLocaleString('id-ID', { ...dateTimeFormatOpts });
 }
